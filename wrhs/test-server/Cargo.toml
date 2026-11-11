@@ -1,0 +1,24 @@
+[package]
+name = "wrhs-av-test-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "RDP test server that streams an H.264 test pattern and a tone, for testing web clients"
+license = "MIT OR Apache-2.0"
+
+# Not part of the IronRDP workspace.
+[workspace]
+
+[dependencies]
+ironrdp-server = { path = "../../crates/ironrdp-server", default-features = false, features = ["egfx", "helper"] }
+ironrdp-egfx = { path = "../../crates/ironrdp-egfx", features = ["openh264-bundled"] }
+ironrdp-dvc = { path = "../../crates/ironrdp-dvc" }
+ironrdp-svc = { path = "../../crates/ironrdp-svc" }
+ironrdp-rdpsnd = { path = "../../crates/ironrdp-rdpsnd" }
+ironrdp-connector = { path = "../../crates/ironrdp-connector" }
+openh264 = { version = "0.9", default-features = false, features = ["source"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
+async-trait = "0.1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
