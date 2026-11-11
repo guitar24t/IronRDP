@@ -5,10 +5,12 @@ use core::time::Duration;
 use std::borrow::Cow;
 use std::rc::Rc;
 
+use crate::audio::{AudioMessage, WasmAudio};
 use crate::canvas::Canvas;
 use crate::clipboard;
 use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
 use crate::error::IronError;
+use crate::gfx::{GraphicsPipelineOutput, GraphicsPipelinePump, SharedGraphicsPipeline};
 use crate::image::extract_partial_image;
 use crate::input::InputTransaction;
 use crate::network_client::WasmNetworkClient;
@@ -34,11 +36,14 @@ use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::rdp::capability_sets::{BitmapCodecs, client_codecs_capabilities};
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
-use ironrdp::rdpdr::Rdpdr;
+use ironrdp::rdpdr::{NoopRdpdrBackend, Rdpdr};
 use ironrdp::rdpdr::pdu::efs::{DEFAULT_PRINTER_DRIVER_NAME, MICROSOFT_PRINT_TO_PDF_DRIVER_NAME};
 use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
 use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
+use ironrdp::session::{
+    ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason, composite_graphics_pipeline,
+};
+use ironrdp::svc::ChannelFlags;
 use ironrdp_core::WriteBuf;
 use ironrdp_futures::{FramedWrite, single_sequence_step_read};
 use rgb::AsPixels as _;
@@ -101,6 +106,12 @@ struct SessionBuilderInner {
     enable_server_pointer: bool,
     legacy_graphics: bool,
     outbound_message_size_limit: Option<usize>,
+
+    // Graphics Pipeline (MS-RDPEGFX), with H.264 decoded by the page when it gives a decoder.
+    graphics_pipeline: bool,
+    h264_decoder: Option<js_sys::Function>,
+    // Audio output (MS-RDPEA) to the page's callbacks.
+    audio_playback: Option<JsValue>,
 }
 
 impl Default for SessionBuilderInner {
@@ -147,6 +158,10 @@ impl Default for SessionBuilderInner {
             enable_server_pointer: true,
             legacy_graphics: false,
             outbound_message_size_limit: None,
+
+            graphics_pipeline: false,
+            h264_decoder: None,
+            audio_playback: None,
         }
     }
 }
@@ -297,6 +312,13 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             };
             |enable_server_pointer: bool| { self.0.borrow_mut().enable_server_pointer = enable_server_pointer };
             |legacy_graphics: bool| { self.0.borrow_mut().legacy_graphics = legacy_graphics };
+            |graphics_pipeline: bool| { self.0.borrow_mut().graphics_pipeline = graphics_pipeline };
+            |h264_decoder: JsValue| {
+                self.0.borrow_mut().h264_decoder = h264_decoder.dyn_into::<js_sys::Function>().ok();
+            };
+            |audio_playback: JsValue| {
+                self.0.borrow_mut().audio_playback = audio_playback.is_object().then_some(audio_playback);
+            };
             |outbound_message_size_limit: f64| {
                 let limit = if outbound_message_size_limit >= 0.0 && outbound_message_size_limit <= f64::from(u32::MAX) {
                     #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -481,6 +503,28 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 
         let (input_events_tx, input_events_rx) = mpsc::unbounded();
 
+        let (graphics_pipeline, h264_decoder, audio_playback) = {
+            let inner = self.0.borrow();
+            (inner.graphics_pipeline, inner.h264_decoder.clone(), inner.audio_playback.clone())
+        };
+
+        let (gfx_forwarder, graphics_pipeline) = if graphics_pipeline {
+            let (pipeline, forwarder, pump) = crate::gfx::graphics_pipeline(h264_decoder, input_events_tx.clone());
+            config.support_dyn_vc_gfx_protocol = true;
+            (Some(forwarder), Some((pipeline, pump)))
+        } else {
+            (None, None)
+        };
+
+        let (audio_backend, audio) = match audio_playback
+            .as_ref()
+            .and_then(|callbacks| crate::audio::web_audio(callbacks, input_events_tx.clone()))
+        {
+            Some((backend, audio)) => (Some(backend), Some(audio)),
+            None => (None, None),
+        };
+        config.enable_audio_playback = audio_backend.is_some();
+
         let clipboard = remote_clipboard_changed_callback.clone().map(|callback| {
             WasmClipboard::new(
                 clipboard::WasmClipboardMessageProxy::new(input_events_tx.clone()),
@@ -572,6 +616,8 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_driver_name,
             computer_name: client_name.clone(),
             use_display_control,
+            gfx_forwarder,
+            audio_backend,
         })
         .await?;
 
@@ -598,6 +644,8 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             connection_result: RefCell::new(Some(connection_result)),
             clipboard: RefCell::new(Some(clipboard)),
             printer: RefCell::new(Some(printer)),
+            graphics_pipeline: RefCell::new(graphics_pipeline),
+            audio,
         })
     }
 }
@@ -619,6 +667,10 @@ pub(crate) enum RdpInputEvent {
         physical_size: Option<(u32, u32)>,
     },
     TerminateSession,
+    /// The graphics pipeline processed a message: send its replies and composite.
+    GraphicsPipeline(GraphicsPipelineOutput),
+    GraphicsPipelineError(ironrdp_pdu::PduError),
+    Audio(AudioMessage),
 }
 
 pub(crate) struct SessionTerminationInfo {
@@ -647,6 +699,9 @@ pub(crate) struct Session {
     rdp_reader: RefCell<Option<ReadHalf<WebSocket>>>,
     clipboard: RefCell<Option<Option<WasmClipboard>>>,
     printer: RefCell<Option<Option<WasmPrinter>>>,
+    // The pump is taken when `run` is called.
+    graphics_pipeline: RefCell<Option<(SharedGraphicsPipeline, GraphicsPipelinePump)>>,
+    audio: Option<WasmAudio>,
 }
 
 impl Session {
@@ -716,6 +771,11 @@ impl iron_remote_desktop::Session for Session {
 
         let mut clipboard = self.clipboard.borrow_mut().take().expect("run called only once");
         let mut wasm_printer = self.printer.borrow_mut().take().expect("run called only once");
+
+        let graphics_pipeline = self.graphics_pipeline.borrow_mut().take().map(|(pipeline, pump)| {
+            spawn_local(pump.run());
+            pipeline
+        });
 
         let mut framed = ironrdp_futures::LocalFuturesFramed::new(rdp_reader);
 
@@ -947,6 +1007,41 @@ impl iron_remote_desktop::Session for Session {
                         RdpInputEvent::TerminateSession => {
                             active_stage.graceful_shutdown()
                                 .context("graceful shutdown")?
+                        }
+                        RdpInputEvent::GraphicsPipeline(output) => {
+                            let mut outputs = Vec::new();
+                            let channel_id = output.channel_id;
+                            let messages = output.into_messages();
+                            if !messages.is_empty() {
+                                let messages = ironrdp::dvc::encode_dvc_messages(channel_id, messages, ChannelFlags::empty())
+                                    .map_err(|e| anyhow::anyhow!("encode graphics pipeline replies: {e}"))?;
+                                outputs.push(ActiveStageOutput::ResponseFrame(active_stage.encode_dvc_messages(messages)?));
+                            }
+                            if let Some(pipeline) = &graphics_pipeline {
+                                let composited = composite_graphics_pipeline(&mut pipeline.lock(), &mut image)?;
+                                if composited.reset
+                                    && let (Some(width), Some(height)) = (
+                                        NonZeroU32::new(u32::from(image.width())),
+                                        NonZeroU32::new(u32::from(image.height())),
+                                    )
+                                {
+                                    debug!(width, height, "Graphics output reset");
+                                    gui.resize(width, height);
+                                }
+                                if let Some(region) = composited.region {
+                                    outputs.push(ActiveStageOutput::GraphicsUpdate(region));
+                                }
+                            }
+                            outputs
+                        }
+                        RdpInputEvent::GraphicsPipelineError(error) => {
+                            return Err(crate::gfx::pipeline_error(error).into());
+                        }
+                        RdpInputEvent::Audio(message) => {
+                            if let Some(audio) = &self.audio {
+                                audio.process(message);
+                            }
+                            Vec::new()
                         }
                     }
                 }
@@ -1661,6 +1756,8 @@ struct ConnectParams {
     /// `computer_name` when constructing the `Rdpdr` processor.
     computer_name: String,
     use_display_control: bool,
+    gfx_forwarder: Option<crate::gfx::GfxForwarder>,
+    audio_backend: Option<crate::audio::WebAudioBackend>,
 }
 
 fn default_printer_driver_name() -> String {
@@ -1711,6 +1808,8 @@ async fn connect(
         printer_driver_name,
         computer_name,
         use_display_control,
+        gfx_forwarder,
+        audio_backend,
     }: ConnectParams,
 ) -> Result<(connector::ConnectionResult, WebSocket), IronError> {
     let mut framed = ironrdp_futures::LocalFuturesFramed::new(ws);
@@ -1724,11 +1823,18 @@ async fn connect(
         connector.attach_static_channel(CliprdrClient::new(Box::new(clipboard_backend)));
     }
 
-    if let Some(printer_backend) = printer_backend {
-        // Windows servers only speak on RDPDR when RDPSND is advertised too
-        // (MS-RDPEFS Appendix A<1>). We do not play audio in the web client,
-        // but the no-op RDPSND processor satisfies that channel dependency.
+    // Windows servers only speak on RDPDR when RDPSND is advertised too
+    // (MS-RDPEFS Appendix A<1>), and only redirect audio when RDPDR is present,
+    // so each channel brings the other: a no-op RDPSND processor for the printer,
+    // and a device-less RDPDR processor for audio.
+    let has_audio = audio_backend.is_some();
+    if let Some(audio_backend) = audio_backend {
+        connector.attach_static_channel(Rdpsnd::new(Box::new(audio_backend)).with_clock(crate::audio::clock()));
+    } else if printer_backend.is_some() {
         connector.attach_static_channel(Rdpsnd::new(Box::new(NoopRdpsndBackend)));
+    }
+
+    if let Some(printer_backend) = printer_backend {
         connector.attach_static_channel(
             Rdpdr::new(Box::new(printer_backend), computer_name).with_printer_driver(
                 printer_device_id,
@@ -1736,12 +1842,19 @@ async fn connect(
                 printer_driver_name,
             ),
         );
+    } else if has_audio {
+        connector.attach_static_channel(Rdpdr::new(Box::new(NoopRdpdrBackend), computer_name));
     }
 
-    if use_display_control {
-        connector.attach_static_channel(
-            DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new()))),
-        );
+    if use_display_control || gfx_forwarder.is_some() {
+        let mut drdynvc = DrdynvcClient::new();
+        if use_display_control {
+            drdynvc = drdynvc.with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
+        }
+        if let Some(gfx_forwarder) = gfx_forwarder {
+            drdynvc = drdynvc.with_dynamic_channel(gfx_forwarder);
+        }
+        connector.attach_static_channel(drdynvc);
     }
 
     let kerberos_config = url::Url::parse(kdc_proxy_url.unwrap_or_default().as_str())
