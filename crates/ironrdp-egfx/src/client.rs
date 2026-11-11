@@ -251,6 +251,42 @@ pub struct BitmapUpdate {
 // Handler Trait
 // ============================================================================
 
+/// The capability sets [`GraphicsPipelineHandler::capabilities`] advertises by default: every
+/// version from 10.7 down to 10 with AVC444, then V8.1 (AVC420) and V8 (no AVC), all with a
+/// small cache.
+pub fn default_capabilities() -> Vec<CapabilitySet> {
+    vec![
+        CapabilitySet::V10_7 {
+            flags: CapabilitiesV107Flags::SMALL_CACHE,
+        },
+        CapabilitySet::V10_6 {
+            flags: CapabilitiesV104Flags::SMALL_CACHE,
+        },
+        CapabilitySet::V10_5 {
+            flags: CapabilitiesV104Flags::SMALL_CACHE,
+        },
+        CapabilitySet::V10_4 {
+            flags: CapabilitiesV104Flags::SMALL_CACHE,
+        },
+        CapabilitySet::V10_3 {
+            flags: CapabilitiesV103Flags::empty(),
+        },
+        CapabilitySet::V10_2 {
+            flags: CapabilitiesV10Flags::SMALL_CACHE,
+        },
+        CapabilitySet::V10_1,
+        CapabilitySet::V10 {
+            flags: CapabilitiesV10Flags::SMALL_CACHE,
+        },
+        CapabilitySet::V8_1 {
+            flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
+        },
+        CapabilitySet::V8 {
+            flags: CapabilitiesV8Flags::SMALL_CACHE,
+        },
+    ]
+}
+
 /// Handler trait for client-side EGFX events
 ///
 /// Implement this trait to receive decoded bitmap data and surface
@@ -273,36 +309,7 @@ pub trait GraphicsPipelineHandler: Send {
     ///
     /// [capability negotiation]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/31c6e2b1-335b-4a75-9454-bb2309958c21
     fn capabilities(&self) -> Vec<CapabilitySet> {
-        vec![
-            CapabilitySet::V10_7 {
-                flags: CapabilitiesV107Flags::SMALL_CACHE,
-            },
-            CapabilitySet::V10_6 {
-                flags: CapabilitiesV104Flags::SMALL_CACHE,
-            },
-            CapabilitySet::V10_5 {
-                flags: CapabilitiesV104Flags::SMALL_CACHE,
-            },
-            CapabilitySet::V10_4 {
-                flags: CapabilitiesV104Flags::SMALL_CACHE,
-            },
-            CapabilitySet::V10_3 {
-                flags: CapabilitiesV103Flags::empty(),
-            },
-            CapabilitySet::V10_2 {
-                flags: CapabilitiesV10Flags::SMALL_CACHE,
-            },
-            CapabilitySet::V10_1,
-            CapabilitySet::V10 {
-                flags: CapabilitiesV10Flags::SMALL_CACHE,
-            },
-            CapabilitySet::V8_1 {
-                flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
-            },
-            CapabilitySet::V8 {
-                flags: CapabilitiesV8Flags::SMALL_CACHE,
-            },
-        ]
+        default_capabilities()
     }
 
     /// Called when the server confirms negotiated capabilities
@@ -717,23 +724,51 @@ impl GraphicsPipelineClient {
     // PDU Handlers
     // ========================================================================
 
-    fn process_messages(&mut self, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+    /// Decompresses one message of the graphics channel and decodes the PDUs it carries,
+    /// without processing them.
+    ///
+    /// Together with [`Self::process_pdu`], this splits [`DvcProcessor::process`] in two, so
+    /// the embedder can look at the PDUs before they are processed. A browser, for example,
+    /// decodes H.264 asynchronously: it decodes the bitstreams of a `WireToSurface1` PDU
+    /// first and has its [`H264Decoder`] return the finished pictures when the PDU is
+    /// processed. Every message must pass through here once and in order, because the
+    /// decompressor keeps a history across messages.
+    pub fn decode_messages(&mut self, payload: &[u8]) -> PduResult<Vec<GfxPdu>> {
+        if self.state == ClientState::Closed {
+            return Err(pdu_other_err!("graphics channel is closed; recreate the channel"));
+        }
         self.decompressed_buffer.clear();
         self.decompressed_buffer.shrink_to(MAX_DECOMPRESSED_BUFFER_CAPACITY);
         self.decompressor
             .decompress(payload, &mut self.decompressed_buffer)
             .map_err(|e| decode_err!(e))?;
 
-        // Decode all PDUs before dispatch while the cursor borrows the buffer.
         let mut pdus = Vec::new();
-        {
-            let mut cursor = ReadCursor::new(self.decompressed_buffer.as_slice());
-            while !cursor.is_empty() {
-                let pdu: GfxPdu = decode_cursor(&mut cursor).map_err(|e| decode_err!(e))?;
-                pdus.push(pdu);
-            }
+        let mut cursor = ReadCursor::new(self.decompressed_buffer.as_slice());
+        while !cursor.is_empty() {
+            let pdu: GfxPdu = decode_cursor(&mut cursor).map_err(|e| decode_err!(e))?;
+            pdus.push(pdu);
         }
+        Ok(pdus)
+    }
 
+    /// Processes one PDU returned by [`Self::decode_messages`] and returns the messages to send
+    /// back to the server (capabilities, frame acknowledgements, cache import offers).
+    ///
+    /// PDUs must be processed in the order they were decoded.
+    pub fn process_pdu(&mut self, pdu: GfxPdu) -> PduResult<Vec<DvcMessage>> {
+        if self.state == ClientState::Closed {
+            return Err(pdu_other_err!("graphics channel is closed; recreate the channel"));
+        }
+        self.handle_pdu(pdu).inspect_err(|_| {
+            if self.state == ClientState::Resetting {
+                self.state = ClientState::Closed;
+            }
+        })
+    }
+
+    fn process_messages(&mut self, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+        let pdus = self.decode_messages(payload)?;
         let mut responses: Vec<DvcMessage> = Vec::new();
         for pdu in pdus {
             let pdu_responses = self.handle_pdu(pdu)?;
@@ -2680,6 +2715,66 @@ mod tests {
         .unwrap();
         client.process(2, &zgfx::wrap_uncompressed(&confirm)).unwrap();
         assert_eq!(client.state, ClientState::Active);
+    }
+
+    /// `decode_messages` then `process_pdu` does what `process` does, so an embedder can
+    /// look at the PDUs (for example, to decode H.264 asynchronously) in between.
+    #[test]
+    fn split_processing_matches_process() {
+        let mut message = Vec::new();
+        for pdu in [
+            GfxPdu::CapabilitiesConfirm(crate::pdu::CapabilitiesConfirmPdu::from_typed(&CapabilitySet::V8 {
+                flags: CapabilitiesV8Flags::empty(),
+            })),
+            GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
+                width: 64,
+                height: 32,
+                monitors: Vec::new(),
+            }),
+            GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+                surface_id: 1,
+                width: 64,
+                height: 32,
+                pixel_format: PixelFormat::XRgb,
+            }),
+            GfxPdu::StartFrame(crate::pdu::StartFramePdu {
+                timestamp: crate::pdu::Timestamp {
+                    milliseconds: 0,
+                    seconds: 0,
+                    minutes: 0,
+                    hours: 0,
+                },
+                frame_id: 5,
+            }),
+            GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id: 5 }),
+        ] {
+            message.extend(ironrdp_core::encode_vec(&pdu).unwrap());
+        }
+        let payload = zgfx::wrap_uncompressed(&message);
+
+        let mut whole = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+        whole.start(1).unwrap();
+        let replies = whole.process(1, &payload).unwrap();
+
+        let mut split = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+        split.start(1).unwrap();
+        let pdus = split.decode_messages(&payload).unwrap();
+        assert_eq!(pdus.len(), 5);
+        let mut split_replies = Vec::new();
+        for pdu in pdus {
+            split_replies.extend(split.process_pdu(pdu).unwrap());
+        }
+
+        assert_eq!(split_replies.len(), replies.len(), "the frame acknowledgement");
+        for (a, b) in split_replies.iter().zip(&replies) {
+            assert_eq!(ironrdp_core::encode_vec(a.as_ref()).unwrap(), ironrdp_core::encode_vec(b.as_ref()).unwrap());
+        }
+        assert!(split.is_active() && whole.is_active());
+        assert!(split.get_surface(1).is_some());
+        assert_eq!(split.total_frames_decoded(), whole.total_frames_decoded());
+
+        split.close(1);
+        assert!(split.decode_messages(&payload).is_err(), "a closed channel decodes nothing");
     }
 
     #[test]
