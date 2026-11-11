@@ -9,7 +9,7 @@
 //! the right along the top, so a test can check the colors and see the picture move.
 //!
 //! Usage: wrhs-av-test-server --bind 127.0.0.1:3390 --cert server.crt --key server.key
-//!        [--sec tls|hybrid] [--user user] [--pass pass]
+//!        [--sec tls|hybrid] [--user user] [--pass pass] [--size 1024x768] [--fps 30]
 
 use core::net::SocketAddr;
 use core::num::{NonZeroU16, NonZeroUsize};
@@ -32,10 +32,22 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{Duration, Instant, interval, sleep_until};
 use tracing::{info, warn};
 
-const WIDTH: u16 = 1024;
-const HEIGHT: u16 = 768;
 const BOX: usize = 64;
-const FRAME_MS: u64 = 33;
+
+/// Desktop size and milliseconds per picture (`--size`, `--fps`).
+static PICTURE: std::sync::OnceLock<(u16, u16, u64)> = std::sync::OnceLock::new();
+
+fn width() -> u16 {
+    PICTURE.get().map_or(1024, |p| p.0)
+}
+
+fn height() -> u16 {
+    PICTURE.get().map_or(768, |p| p.1)
+}
+
+fn frame_ms() -> u64 {
+    PICTURE.get().map_or(33, |p| p.2)
+}
 
 type Events = Arc<Mutex<Option<UnboundedSender<ServerEvent>>>>;
 
@@ -47,7 +59,7 @@ fn send(events: &Events, event: ServerEvent) {
 
 /// Picture `n` of the test pattern, RGBA.
 fn pattern(n: u64) -> Vec<u8> {
-    let (w, h) = (usize::from(WIDTH), usize::from(HEIGHT));
+    let (w, h) = (usize::from(width()), usize::from(height()));
     let box_x = usize::try_from(n * 8).expect("fits") % (w - BOX);
     let mut rgba = vec![0u8; w * h * 4];
     for y in 0..h {
@@ -117,8 +129,8 @@ struct Display {
 impl RdpServerDisplay for Display {
     async fn size(&mut self) -> DesktopSize {
         DesktopSize {
-            width: WIDTH,
-            height: HEIGHT,
+            width: width(),
+            height: height(),
         }
     }
 
@@ -161,8 +173,8 @@ impl Updates {
         let surface = match self.surface {
             Some(surface) => surface,
             None => {
-                server.set_output_dimensions(WIDTH, HEIGHT);
-                let surface = server.create_surface(WIDTH, HEIGHT).context("create surface")?;
+                server.set_output_dimensions(width(), height());
+                let surface = server.create_surface(width(), height()).context("create surface")?;
                 server.map_surface_to_output(surface, 0, 0);
                 if server.supports_avc420() {
                     self.encoder = Some(openh264::encoder::Encoder::new().context("H.264 encoder")?);
@@ -176,21 +188,21 @@ impl Updates {
         // Skipping a frame after encoding it would break the H.264 reference chain.
         if !server.should_backpressure() {
             let rgba = pattern(self.frame);
-            let ts = u32::try_from((self.frame * FRAME_MS) % u64::from(u32::MAX)).expect("fits");
+            let ts = u32::try_from((self.frame * frame_ms()) % u64::from(u32::MAX)).expect("fits");
             if let Some(encoder) = self.encoder.as_mut() {
-                let (w, h) = (usize::from(WIDTH), usize::from(HEIGHT));
+                let (w, h) = (usize::from(width()), usize::from(height()));
                 let (y, u, v) = rgba_to_yuv420(&rgba, w, h);
                 let yuv = openh264::formats::YUVSlices::new((&y, &u, &v), (w, h), (w, w / 2, w / 2));
                 let data = encoder.encode(&yuv).context("encode")?.to_vec();
                 if !data.is_empty()
                     && server
-                        .send_avc420_frame(surface, &data, &[Avc420Region::full_frame(WIDTH, HEIGHT, 22)], ts)
+                        .send_avc420_frame(surface, &data, &[Avc420Region::full_frame(width(), height(), 22)], ts)
                         .is_none()
                 {
                     encoder.force_intra_frame();
                 }
             } else {
-                server.send_uncompressed_frame(surface, &rgba_to_bgra(&rgba), WIDTH, HEIGHT, ts);
+                server.send_uncompressed_frame(surface, &rgba_to_bgra(&rgba), width(), height(), ts);
             }
         }
         let channel_id = server.channel_id();
@@ -215,7 +227,7 @@ impl RdpServerDisplayUpdates for Updates {
     async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
         loop {
             sleep_until(self.next_frame).await;
-            self.next_frame = (self.next_frame + Duration::from_millis(FRAME_MS)).max(Instant::now());
+            self.next_frame = (self.next_frame + Duration::from_millis(frame_ms())).max(Instant::now());
             self.frame += 1;
             match self.send_gfx() {
                 Ok(true) => continue,
@@ -226,16 +238,14 @@ impl RdpServerDisplayUpdates for Updates {
             if self.gfx.is_some() && self.frame < 60 || self.frame % 3 != 0 {
                 continue;
             }
-            let width = NonZeroU16::new(WIDTH).expect("non-zero");
-            let height = NonZeroU16::new(HEIGHT).expect("non-zero");
             return Ok(Some(DisplayUpdate::Bitmap(BitmapUpdate {
                 x: 0,
                 y: 0,
-                width,
-                height,
+                width: NonZeroU16::new(width()).expect("non-zero"),
+                height: NonZeroU16::new(height()).expect("non-zero"),
                 format: PixelFormat::BgrA32,
                 data: rgba_to_bgra(&pattern(self.frame)).into(),
-                stride: NonZeroUsize::new(usize::from(WIDTH) * 4).expect("non-zero"),
+                stride: NonZeroUsize::new(usize::from(width()) * 4).expect("non-zero"),
             })));
         }
     }
@@ -388,6 +398,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut hybrid = false;
     let mut user = "user".to_owned();
     let mut pass = "pass".to_owned();
+    let (mut w, mut h, mut fps) = (1024u16, 768u16, 30u64);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
@@ -404,9 +415,19 @@ fn parse_args() -> anyhow::Result<Args> {
             }
             "--user" => user = value()?,
             "--pass" => pass = value()?,
+            "--size" => {
+                let size = value()?;
+                let (a, b) = size.split_once('x').context("--size WxH")?;
+                (w, h) = (a.parse()?, b.parse()?);
+                if w % 16 != 0 || h % 2 != 0 {
+                    bail!("--size: the width must be a multiple of 16 and the height even");
+                }
+            }
+            "--fps" => fps = value()?.parse::<u64>()?.clamp(1, 120),
             other => bail!("unknown argument {other}"),
         }
     }
+    PICTURE.set((w, h, 1000 / fps)).ok();
     Ok(Args {
         bind: bind.context("--bind")?,
         cert: cert.context("--cert")?,
