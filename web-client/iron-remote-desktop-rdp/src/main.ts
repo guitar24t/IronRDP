@@ -123,6 +123,18 @@ export interface AudioPlaybackCallbacks {
      * queued, which the server uses to keep audio and video in step.
      */
     wave(data: Uint8Array, sampleRate: number, channels: number): number;
+    /**
+     * Compressed formats `encoded` decodes itself: `"aac"` (AAC-LC, raw frames or ADTS, as
+     * Windows sends `WAVE_FORMAT_AAC_MS`). The client prefers them, then ADPCM (which it
+     * decodes itself and hands to `wave`), and uses uncompressed PCM only when the server
+     * offers neither.
+     */
+    codecs?: string[];
+    /**
+     * Plays one frame of a format listed in `codecs`. Returns how many milliseconds of audio
+     * are queued, like `wave`.
+     */
+    encoded?(codec: string, data: Uint8Array, sampleRate: number, channels: number): number;
     /** Volume of each channel, 0 to 65535. */
     volume?(left: number, right: number): void;
     /** The server stopped the audio stream. */
