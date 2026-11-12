@@ -33,16 +33,15 @@ use ironrdp::connector::{self, ClientConnector, Credentials};
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
+use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::rdp::capability_sets::{BitmapCodecs, client_codecs_capabilities};
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
-use ironrdp::rdpdr::{NoopRdpdrBackend, Rdpdr};
 use ironrdp::rdpdr::pdu::efs::{DEFAULT_PRINTER_DRIVER_NAME, MICROSOFT_PRINT_TO_PDF_DRIVER_NAME};
+use ironrdp::rdpdr::{NoopRdpdrBackend, Rdpdr};
 use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
 use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{
-    ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason, composite_graphics_pipeline,
-};
+use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
 use ironrdp::svc::ChannelFlags;
 use ironrdp_core::WriteBuf;
 use ironrdp_futures::{FramedWrite, single_sequence_step_read};
@@ -505,7 +504,11 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 
         let (graphics_pipeline, h264_decoder, audio_playback) = {
             let inner = self.0.borrow();
-            (inner.graphics_pipeline, inner.h264_decoder.clone(), inner.audio_playback.clone())
+            (
+                inner.graphics_pipeline,
+                inner.h264_decoder.clone(),
+                inner.audio_playback.clone(),
+            )
         };
 
         let (gfx_forwarder, graphics_pipeline) = if graphics_pipeline {
@@ -1018,18 +1021,43 @@ impl iron_remote_desktop::Session for Session {
                                 outputs.push(ActiveStageOutput::ResponseFrame(active_stage.encode_dvc_messages(messages)?));
                             }
                             if let Some(pipeline) = &graphics_pipeline {
-                                let composited = composite_graphics_pipeline(&mut pipeline.lock(), &mut image)?;
-                                if composited.reset
-                                    && let (Some(width), Some(height)) = (
-                                        NonZeroU32::new(u32::from(image.width())),
-                                        NonZeroU32::new(u32::from(image.height())),
-                                    )
-                                {
+                                let (reset, updates) = {
+                                    let mut gfx = pipeline.lock();
+                                    // RemoteApp windows are not meaningful to the web component.
+                                    drop(gfx.drain_window_updates());
+                                    (gfx.take_output_reset(), gfx.drain_output())
+                                };
+                                if let Some((width, height)) = reset {
                                     debug!(width, height, "Graphics output reset");
-                                    gui.resize(width, height);
+                                    // The image only serves the classic bitmap updates; keep its size in step.
+                                    let size = connector::DesktopSize { width, height };
+                                    ensure_framebuffer_allocatable(size)?;
+                                    image = DecodedImage::new(PixelFormat::RgbA32, width, height);
+                                    if let (Some(width), Some(height)) =
+                                        (NonZeroU32::new(u32::from(width)), NonZeroU32::new(u32::from(height)))
+                                    {
+                                        gui.resize(width, height);
+                                    }
                                 }
-                                if let Some(region) = composited.region {
-                                    outputs.push(ActiveStageOutput::GraphicsUpdate(region));
+                                // The compositor's output goes straight to the canvas: copying it into the
+                                // image first would only have it copied out again for drawing.
+                                for mut update in updates {
+                                    let region = &update.region;
+                                    if region.left >= region.right
+                                        || region.top >= region.bottom
+                                        || region.right > image.width()
+                                        || region.bottom > image.height()
+                                    {
+                                        warn!(?region, "Dropping a graphics update outside the output");
+                                        continue;
+                                    }
+                                    let region = InclusiveRectangle {
+                                        left: region.left,
+                                        top: region.top,
+                                        right: region.right - 1,
+                                        bottom: region.bottom - 1,
+                                    };
+                                    gui.draw(&mut update.data, region).context("draw graphics update")?;
                                 }
                             }
                             outputs
