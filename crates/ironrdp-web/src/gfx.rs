@@ -21,7 +21,7 @@
 //! [MS-RDPEGFX]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
 
 use core::fmt;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -41,6 +41,15 @@ use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
 use crate::session::RdpInputEvent;
+
+/// Most H.264 streams decoded at once: the limit `GraphicsPipelineClient` applies to its own
+/// decoders (twice the 16 monitors RDP allows), since a server can create surfaces freely.
+const MAX_DECODERS: usize = 32;
+
+/// Most bytes of graphics messages waiting for the pump. A server that ignores frame
+/// acknowledgements could otherwise grow the queue without limit while pictures decode;
+/// past this, the session ends.
+const MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
 
 /// After H.264 has failed this long without a picture decoding, ask for a protocol reset.
 const RECOVER_AFTER_MS: f64 = 2_000.0;
@@ -155,16 +164,19 @@ pub(crate) fn graphics_pipeline(
     let pipeline = SharedGraphicsPipeline(Arc::new(Mutex::new(client)));
     let generation = Arc::new(AtomicU32::new(0));
     let (tx, rx) = mpsc::unbounded();
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
 
     let forwarder = GfxForwarder {
         pipeline: pipeline.clone(),
         generation: Arc::clone(&generation),
         tx,
+        queued_bytes: Arc::clone(&queued_bytes),
     };
     let pump = GraphicsPipelinePump {
         pipeline: pipeline.clone(),
         generation,
         rx,
+        queued_bytes,
         prefetched,
         decoder_factory: h264_decoder_factory,
         decoders: BTreeMap::new(),
@@ -184,6 +196,8 @@ pub(crate) struct GfxForwarder {
     pipeline: SharedGraphicsPipeline,
     generation: Arc<AtomicU32>,
     tx: mpsc::UnboundedSender<QueuedMessage>,
+    /// Bytes queued for the pump and not yet processed.
+    queued_bytes: Arc<AtomicUsize>,
 }
 
 impl_as_any!(GfxForwarder);
@@ -200,6 +214,10 @@ impl DvcProcessor for GfxForwarder {
     }
 
     fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+        let queued = self.queued_bytes.fetch_add(payload.len(), Ordering::Relaxed) + payload.len();
+        if queued > MAX_QUEUED_BYTES {
+            return Err(pdu_other_err!("the server sends graphics faster than they can be decoded"));
+        }
         let message = QueuedMessage {
             channel_id,
             generation: self.generation.load(Ordering::Relaxed),
@@ -286,6 +304,7 @@ pub(crate) struct GraphicsPipelinePump {
     pipeline: SharedGraphicsPipeline,
     generation: Arc<AtomicU32>,
     rx: mpsc::UnboundedReceiver<QueuedMessage>,
+    queued_bytes: Arc<AtomicUsize>,
     prefetched: PrefetchQueue,
     decoder_factory: Option<js_sys::Function>,
     /// The JavaScript decoder of each surface's H.264 stream.
@@ -299,6 +318,7 @@ pub(crate) struct GraphicsPipelinePump {
 impl GraphicsPipelinePump {
     pub(crate) async fn run(mut self) {
         while let Some(message) = self.rx.next().await {
+            self.queued_bytes.fetch_sub(message.payload.len(), Ordering::Relaxed);
             if message.generation != self.generation.load(Ordering::Relaxed) {
                 continue;
             }
@@ -363,6 +383,10 @@ impl GraphicsPipelinePump {
     }
 
     async fn prefetch(&mut self, surface_id: u16, data: &[u8]) {
+        // The pipeline drops updates for surfaces it does not know: decode nothing for them.
+        if self.pipeline.lock().get_surface(surface_id).is_none() {
+            return;
+        }
         let picture = self.decode(surface_id, data).await;
         match &picture {
             Ok(_) => self.failing_since = None,
@@ -397,6 +421,9 @@ impl GraphicsPipelinePump {
     fn decoder(&mut self, surface_id: u16) -> Result<JsValue, String> {
         if let Some(decoder) = self.decoders.get(&surface_id) {
             return Ok(decoder.clone());
+        }
+        if MAX_DECODERS <= self.decoders.len() {
+            return Err("too many surfaces sending H.264".to_owned());
         }
         let factory = self.decoder_factory.as_ref().ok_or("no H.264 decoder")?;
         let decoder = factory
