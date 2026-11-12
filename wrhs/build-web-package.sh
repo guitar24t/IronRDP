@@ -12,7 +12,8 @@ remap="--remap-path-prefix=$(native "$root")=/IronRDP"
 remap+=" --remap-path-prefix=$(native "${CARGO_HOME:-$HOME/.cargo}")=/cargo"
 remap+=" --remap-path-prefix=$(native "${RUSTUP_HOME:-$HOME/.rustup}")=/rustup"
 export RUSTFLAGS="-Ctarget-feature=+simd128,+bulk-memory --cfg getrandom_backend=\"wasm_js\" -Copt-level=s -Ccodegen-units=1 -Cllvm-args=-enable-dfa-jump-thread $remap"
-wasm-pack build --target web
+# WASM_PACK_PROFILE=--profiling keeps function names (for profiling only; not for release).
+wasm-pack build ${WASM_PACK_PROFILE:-} --target web
 js=pkg/ironrdp_web.js
 # Vite inlines the WebAssembly when it is imported with ?url (see xtask/src/web.rs).
 node -e '

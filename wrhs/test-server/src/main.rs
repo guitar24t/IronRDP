@@ -143,6 +143,8 @@ impl RdpServerDisplay for Display {
             next_frame: Instant::now(),
             surface: None,
             encoder: None,
+            encoded: Vec::new(),
+            sent: 0,
         }))
     }
 }
@@ -156,7 +158,15 @@ struct Updates {
     next_frame: Instant,
     surface: Option<u16>,
     encoder: Option<openh264::encoder::Encoder>,
+    /// The H.264 pictures of one loop, encoded on the first pass and sent again after, so
+    /// that encoding (in software, on the same machine) does not limit the picture rate.
+    encoded: Vec<Vec<u8>>,
+    /// H.264 pictures sent.
+    sent: u64,
 }
+
+/// Pictures in the H.264 loop: two seconds at 30 per second, starting with a key frame.
+const LOOP: u64 = 60;
 
 impl Updates {
     /// Sends one picture over the Graphics Pipeline. Returns false when the pipeline
@@ -187,21 +197,32 @@ impl Updates {
         };
         // Skipping a frame after encoding it would break the H.264 reference chain.
         if !server.should_backpressure() {
-            let rgba = pattern(self.frame);
             let ts = u32::try_from((self.frame * frame_ms()) % u64::from(u32::MAX)).expect("fits");
             if let Some(encoder) = self.encoder.as_mut() {
-                let (w, h) = (usize::from(width()), usize::from(height()));
-                let (y, u, v) = rgba_to_yuv420(&rgba, w, h);
-                let yuv = openh264::formats::YUVSlices::new((&y, &u, &v), (w, h), (w, w / 2, w / 2));
-                let data = encoder.encode(&yuv).context("encode")?.to_vec();
-                if !data.is_empty()
-                    && server
-                        .send_avc420_frame(surface, &data, &[Avc420Region::full_frame(width(), height(), 22)], ts)
-                        .is_none()
-                {
-                    encoder.force_intra_frame();
+                let index = usize::try_from(self.sent % LOOP).expect("fits");
+                if self.encoded.len() <= index {
+                    let (w, h) = (usize::from(width()), usize::from(height()));
+                    let (y, u, v) = rgba_to_yuv420(&pattern(self.sent % LOOP), w, h);
+                    let yuv = openh264::formats::YUVSlices::new((&y, &u, &v), (w, h), (w, w / 2, w / 2));
+                    if index == 0 {
+                        encoder.force_intra_frame();
+                    }
+                    self.encoded.push(encoder.encode(&yuv).context("encode")?.to_vec());
+                }
+                let data = &self.encoded[index];
+                let region = [Avc420Region::full_frame(width(), height(), 22)];
+                if server.send_avc420_frame(surface, data, &region, ts).is_some() {
+                    self.sent += 1;
+                } else if self.encoded.len() < usize::try_from(LOOP).expect("fits") {
+                    // Not sent during the first pass: start the loop over.
+                    self.encoded.clear();
+                    self.sent = 0;
+                } else {
+                    // Go on from the next loop's key frame.
+                    self.sent = (self.sent / LOOP + 1) * LOOP;
                 }
             } else {
+                let rgba = pattern(self.frame);
                 server.send_uncompressed_frame(surface, &rgba_to_bgra(&rgba), width(), height(), ts);
             }
         }
@@ -314,30 +335,87 @@ struct Tone {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
-const FORMATS: [AudioFormat; 2] = [
-    AudioFormat {
-        format: WaveFormat::PCM,
-        n_channels: 2,
-        n_samples_per_sec: 48_000,
-        n_avg_bytes_per_sec: 192_000,
-        n_block_align: 4,
-        bits_per_sample: 16,
-        data: None,
-    },
-    AudioFormat {
-        format: WaveFormat::PCM,
-        n_channels: 2,
-        n_samples_per_sec: 44_100,
-        n_avg_bytes_per_sec: 176_400,
-        n_block_align: 4,
-        bits_per_sample: 16,
-        data: None,
-    },
-];
+/// Raw AAC-LC frames of the same tone (44.1 kHz stereo, about 96 kbit/s), as
+/// `[u16 big-endian length][frame]`, made with a browser's AAC encoder.
+const AAC_FRAMES: &[u8] = include_bytes!("../assets/tone-440hz-44100-stereo.aac");
+
+/// Whether to wrap AAC frames in ADTS headers (`--aac-adts`).
+static AAC_ADTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What Windows offers, best first: AAC without extra bytes (as Windows Server 2025 does),
+/// MS ADPCM, then PCM. The client advertises the ones it wants, and the first common one wins.
+fn formats() -> &'static [AudioFormat] {
+    static FORMATS: std::sync::OnceLock<Vec<AudioFormat>> = std::sync::OnceLock::new();
+    FORMATS.get_or_init(|| {
+        let pcm = |rate: u32| AudioFormat {
+            format: WaveFormat::PCM,
+            n_channels: 2,
+            n_samples_per_sec: rate,
+            n_avg_bytes_per_sec: rate * 4,
+            n_block_align: 4,
+            bits_per_sample: 16,
+            data: None,
+        };
+        vec![
+            AudioFormat {
+                format: WaveFormat::AAC_MS,
+                n_channels: 2,
+                n_samples_per_sec: 44_100,
+                n_avg_bytes_per_sec: 12_000,
+                n_block_align: 4,
+                bits_per_sample: 16,
+                data: None,
+            },
+            ironrdp_rdpsnd::codec::ms_adpcm_format(2, 44_100, 2048),
+            pcm(48_000),
+            pcm(44_100),
+        ]
+    })
+}
+
+fn aac_frames() -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    let mut rest = AAC_FRAMES;
+    while let [hi, lo, tail @ ..] = rest {
+        let len = usize::from(u16::from_be_bytes([*hi, *lo]));
+        let Some((frame, next)) = tail.split_at_checked(len) else { break };
+        frames.push(frame.to_vec());
+        rest = next;
+    }
+    frames
+}
+
+/// An ADTS header for an AAC-LC frame of `len` bytes, 44.1 kHz stereo.
+fn adts_header(len: usize) -> [u8; 7] {
+    let full = len + 7;
+    let (profile, frequency, channels) = (1u8, 4u8, 2u8); // AAC-LC, 44.1 kHz, stereo
+    [
+        0xFF,
+        0xF1,
+        (profile << 6) | (frequency << 2) | (channels >> 2),
+        ((channels & 3) << 6) | u8::try_from((full >> 11) & 3).expect("2 bits"),
+        u8::try_from((full >> 3) & 0xFF).expect("8 bits"),
+        (u8::try_from(full & 7).expect("3 bits") << 5) | 0x1F,
+        0xFC,
+    ]
+}
+
+/// One 20 ms block of the tone, interleaved stereo.
+fn tone(rate: u32, phase: &mut f64) -> Vec<i16> {
+    let step = 2.0 * core::f64::consts::PI * 440.0 / f64::from(rate);
+    let mut samples = Vec::new();
+    for _ in 0..rate / 50 {
+        #[expect(clippy::cast_possible_truncation, clippy::as_conversions)]
+        let sample = (phase.sin() * 0.3 * 32767.0) as i16;
+        *phase = (*phase + step) % (2.0 * core::f64::consts::PI);
+        samples.extend_from_slice(&[sample, sample]);
+    }
+    samples
+}
 
 impl RdpsndServerHandler for Tone {
     fn get_formats(&self) -> &[AudioFormat] {
-        &FORMATS
+        formats()
     }
 
     fn choose_format<'a>(&mut self, common: &'a [NegotiatedFormat]) -> Option<&'a NegotiatedFormat> {
@@ -345,29 +423,66 @@ impl RdpsndServerHandler for Tone {
     }
 
     fn start(&mut self, format: &NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
-        let rate = format.format().n_samples_per_sec;
-        println!("audio-start rate={rate}");
+        let format = format.format().clone();
+        let rate = format.n_samples_per_sec;
+        let adts = AAC_ADTS.load(core::sync::atomic::Ordering::Relaxed);
+        println!(
+            "audio-start rate={rate} format={}",
+            match format.format {
+                WaveFormat::AAC_MS if adts => "aac-adts",
+                WaveFormat::AAC_MS => "aac",
+                WaveFormat::ADPCM => "adpcm",
+                _ => "pcm",
+            }
+        );
         let events = Arc::clone(&self.events);
+        let mut encoder = (format.format == WaveFormat::ADPCM)
+            .then(|| ironrdp_rdpsnd::codec::AudioEncoder::new(&format))
+            .transpose()
+            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Box<dyn RdpsndError>)?;
+        let aac = (format.format == WaveFormat::AAC_MS).then(aac_frames);
         self.task = Some(tokio::spawn(async move {
             let mut tick = interval(Duration::from_millis(20));
-            let mut ts: u16 = 0;
+            let started = Instant::now();
+            let mut ts: u32 = 0;
             let mut phase = 0.0f64;
-            let step = 2.0 * core::f64::consts::PI * 440.0 / f64::from(rate);
+            let mut frames_sent = 0u64;
+            // Bytes of audio sent, reported every 5 s to compare the formats' bandwidth.
+            let (mut bytes, mut reported) = (0u64, Instant::now());
+            let mut wave = |data: Vec<u8>, ts: u32| {
+                bytes += u64::try_from(data.len()).expect("fits");
+                if reported.elapsed() >= Duration::from_secs(5) {
+                    println!("audio-bandwidth kbit/s={}", bytes * 8 / 5 / 1000);
+                    (bytes, reported) = (0, Instant::now());
+                }
+                send(&events, ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, ts)));
+            };
             loop {
                 tick.tick().await;
-                let mut data = Vec::new();
-                for _ in 0..rate / 50 {
-                    #[expect(clippy::cast_possible_truncation, clippy::as_conversions)]
-                    let sample = (phase.sin() * 0.3 * 32767.0) as i16;
-                    phase = (phase + step) % (2.0 * core::f64::consts::PI);
-                    data.extend_from_slice(&sample.to_le_bytes());
-                    data.extend_from_slice(&sample.to_le_bytes());
+                if let Some(frames) = &aac {
+                    // One AAC frame per wave block, each 1024 samples, kept in step with the clock.
+                    let due = started.elapsed().as_secs_f64() * f64::from(rate) / 1024.0;
+                    #[expect(clippy::as_conversions, clippy::cast_precision_loss)]
+                    while (frames_sent as f64) < due {
+                        let index = usize::try_from(frames_sent).expect("fits") % frames.len();
+                        let frame = &frames[index];
+                        let data = if adts { [&adts_header(frame.len())[..], frame].concat() } else { frame.clone() };
+                        wave(data, ts);
+                        frames_sent += 1;
+                        ts = ts.wrapping_add(23);
+                    }
+                } else if let Some(encoder) = encoder.as_mut() {
+                    let mut data = Vec::new();
+                    encoder.encode(&tone(rate, &mut phase), &mut data);
+                    if !data.is_empty() {
+                        wave(data, ts);
+                    }
+                    ts = ts.wrapping_add(20);
+                } else {
+                    let data = tone(rate, &mut phase).into_iter().flat_map(i16::to_le_bytes).collect();
+                    wave(data, ts);
+                    ts = ts.wrapping_add(20);
                 }
-                send(
-                    &events,
-                    ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, u32::from(ts))),
-                );
-                ts = ts.wrapping_add(20);
             }
         }));
         Ok(())
@@ -424,6 +539,7 @@ fn parse_args() -> anyhow::Result<Args> {
                 }
             }
             "--fps" => fps = value()?.parse::<u64>()?.clamp(1, 120),
+            "--aac-adts" => AAC_ADTS.store(true, core::sync::atomic::Ordering::Relaxed),
             other => bail!("unknown argument {other}"),
         }
     }
