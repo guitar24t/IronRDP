@@ -197,12 +197,107 @@ impl Yuv420Frame {
             let (Some(y), Some(u), Some(v)) = (self.luma_row(row), self.u_row(row / 2), self.v_row(row / 2)) else {
                 break;
             };
-            for (col, &y) in y.iter().enumerate() {
+            // 16 pixels at a time where SIMD is available; the rest one by one.
+            let done = row_to_rgba_simd(y, u, v, &mut rgba);
+            for (col, &y) in y.iter().enumerate().skip(done) {
                 rgba.extend_from_slice(&crate::avc444::yuv_to_rgba(y, u[col / 2], v[col / 2]));
             }
         }
         DecodedFrame::new(rgba, u32::from(self.width), u32::from(self.height))
     }
+}
+
+/// Converts the leading multiple of 16 pixels of a row with WebAssembly SIMD, appending them to
+/// `out`, and returns how many it converted.
+///
+/// Bit-exact with [`crate::avc444::yuv_to_rgba`]: since `256 * y` is a multiple of 256,
+/// `(256 * y + k) >> 8 == y + (k >> 8)`, so each chroma term is computed once per chroma sample
+/// (in 32-bit lanes), added to the luma in 16-bit lanes, and the saturating narrow to `u8` is the
+/// same clamp to 0..=255.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn row_to_rgba_simd(y: &[u8], u: &[u8], v: &[u8], out: &mut Vec<u8>) -> usize {
+    use core::arch::wasm32::*;
+
+    // `(ka * a + kb * b) >> 8` for 8 chroma samples, in 32-bit lanes, narrowed back to 16 bits
+    // (the results lie within -256..=256).
+    fn term(a: v128, ka: i32, b: v128, kb: i32) -> v128 {
+        let (ka, kb) = (i32x4_splat(ka), i32x4_splat(kb));
+        let low = i32x4_add(
+            i32x4_mul(i32x4_extend_low_i16x8(a), ka),
+            i32x4_mul(i32x4_extend_low_i16x8(b), kb),
+        );
+        let high = i32x4_add(
+            i32x4_mul(i32x4_extend_high_i16x8(a), ka),
+            i32x4_mul(i32x4_extend_high_i16x8(b), kb),
+        );
+        i16x8_narrow_i32x4(i32x4_shr(low, 8), i32x4_shr(high, 8))
+    }
+
+    // The chroma terms of red, green and blue.
+    fn terms(u: v128, v: v128) -> (v128, v128, v128) {
+        (term(v, 403, u, 0), term(u, -48, v, -120), term(u, 475, v, 0))
+    }
+
+    let blocks = y.len() / 16;
+    let mut pixels = [0u8; 64];
+    for block in 0..blocks {
+        let (px, c) = (block * 16, block * 8);
+        let (Some(y), Some(u), Some(v)) = (y.get(px..px + 16), u.get(c..c + 8), v.get(c..c + 8)) else {
+            return block * 16;
+        };
+        let mut u8s = [0u8; 16];
+        let mut v8s = [0u8; 16];
+        u8s[..8].copy_from_slice(u);
+        v8s[..8].copy_from_slice(v);
+        // SAFETY: each slice is exactly 16 bytes long, and v128_load reads 16 bytes without
+        // alignment requirements.
+        let (y, u, v) = unsafe {
+            (
+                v128_load(y.as_ptr().cast()),
+                v128_load(u8s.as_ptr().cast()),
+                v128_load(v8s.as_ptr().cast()),
+            )
+        };
+        let center = i16x8_splat(128);
+        let u = i16x8_sub(u16x8_extend_low_u8x16(u), center);
+        let v = i16x8_sub(u16x8_extend_low_u8x16(v), center);
+        let (red, green, blue) = terms(u, v);
+
+        // Each chroma sample serves two neighbouring pixels.
+        let channel = |term: v128| {
+            let low = i16x8_shuffle::<0, 0, 1, 1, 2, 2, 3, 3>(term, term);
+            let high = i16x8_shuffle::<4, 4, 5, 5, 6, 6, 7, 7>(term, term);
+            u8x16_narrow_i16x8(
+                i16x8_add(u16x8_extend_low_u8x16(y), low),
+                i16x8_add(u16x8_extend_high_u8x16(y), high),
+            )
+        };
+        let (r, g, b, a) = (channel(red), channel(green), channel(blue), u8x16_splat(0xFF));
+
+        // Interleave into R G B A per pixel.
+        let rg_low = u8x16_shuffle::<0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23>(r, g);
+        let rg_high = u8x16_shuffle::<8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31>(r, g);
+        let ba_low = u8x16_shuffle::<0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23>(b, a);
+        let ba_high = u8x16_shuffle::<8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31>(b, a);
+        let quarters = [
+            i16x8_shuffle::<0, 8, 1, 9, 2, 10, 3, 11>(rg_low, ba_low),
+            i16x8_shuffle::<4, 12, 5, 13, 6, 14, 7, 15>(rg_low, ba_low),
+            i16x8_shuffle::<0, 8, 1, 9, 2, 10, 3, 11>(rg_high, ba_high),
+            i16x8_shuffle::<4, 12, 5, 13, 6, 14, 7, 15>(rg_high, ba_high),
+        ];
+        for (chunk, quarter) in pixels.chunks_exact_mut(16).zip(quarters) {
+            // SAFETY: `chunk` is exactly 16 bytes long, and v128_store writes 16 bytes without
+            // alignment requirements.
+            unsafe { v128_store(chunk.as_mut_ptr().cast(), quarter) };
+        }
+        out.extend_from_slice(&pixels);
+    }
+    blocks * 16
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+fn row_to_rgba_simd(_y: &[u8], _u: &[u8], _v: &[u8], _out: &mut Vec<u8>) -> usize {
+    0
 }
 
 impl fmt::Debug for Yuv420Frame {
@@ -552,3 +647,49 @@ mod openh264_impl {
 
 #[cfg(feature = "openh264")]
 pub use openh264_impl::OpenH264Decoder;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The conversion gives exactly what the per-pixel transform gives: odd sizes, padded strides,
+    /// and widths with and without a remainder after the 16-pixel SIMD blocks.
+    #[test]
+    fn to_rgba_matches_the_per_pixel_transform() {
+        let sizes = [(1u16, 1u16, 1usize, 1usize), (5, 3, 8, 4), (16, 2, 16, 8), (37, 5, 40, 20), (64, 4, 64, 32), (33, 3, 48, 24)];
+        let mut seed = 0x1234_5678u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed.to_le_bytes()[3]
+        };
+        for (width, height, luma_stride, chroma_stride) in sizes {
+            let (w, h) = (usize::from(width), usize::from(height));
+            let ch = h.div_ceil(2);
+            let mut y: Vec<u8> = (0..luma_stride * h).map(|_| next()).collect();
+            let mut u: Vec<u8> = (0..chroma_stride * ch).map(|_| next()).collect();
+            let mut v: Vec<u8> = (0..chroma_stride * ch).map(|_| next()).collect();
+            // The extremes of every channel, where the clamps act.
+            let (last_y, last_c) = (y.len() - 1, u.len() - 1);
+            for (i, value) in [0u8, 255, 0, 255, 128].into_iter().enumerate() {
+                y[i.min(last_y)] = value;
+                u[i.min(last_c)] = 255 - value;
+                v[i.min(last_c)] = value;
+            }
+            let frame = Yuv420Frame::new(width, height, y.clone(), luma_stride, u.clone(), v.clone(), chroma_stride)
+                .expect("valid planes");
+
+            let mut expected = Vec::new();
+            for row in 0..h {
+                for col in 0..w {
+                    let chroma = (row / 2) * chroma_stride + col / 2;
+                    expected.extend_from_slice(&crate::avc444::yuv_to_rgba(
+                        y[row * luma_stride + col],
+                        u[chroma],
+                        v[chroma],
+                    ));
+                }
+            }
+            assert_eq!(frame.to_rgba().data(), expected.as_slice(), "{width}x{height}");
+        }
+    }
+}
